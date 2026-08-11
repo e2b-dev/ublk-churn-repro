@@ -67,6 +67,61 @@ jobs:
           echo "guest status: $(cat vm-status 2>/dev/null || echo '<none>')"
           test "$(cat vm-status)" = "0"
 
+  mainline:
+    # Is the 7.0 wedge upstream, or Ubuntu-specific? Ubuntu's own
+    # mainline builds are vanilla kernel.org trees with no Ubuntu
+    # patches, so a clean mainline v7.0 next to a wedging
+    # 7.0.0-28-generic points at Ubuntu's backports, and a wedging
+    # mainline points upstream.
+    name: mainline ${{ matrix.tag }} (microVM)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - tag: v7.0 # what noble's hwe-7.0 is based on
+            prefix: "7.0"
+          - tag: v7.0.12 # newest 7.0 stable, in case it is already fixed
+            prefix: "7.0"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Install virtme-ng and the mainline kernel
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends virtme-ng qemu-system-x86 virtiofsd
+          base="https://kernel.ubuntu.com/mainline/${{ matrix.tag }}/amd64/"
+          mkdir -p /tmp/ml && cd /tmp/ml
+          # image + modules only; headers are not needed to boot.
+          for f in $(curl -sS "$base" | grep -oE '[a-z0-9._+-]+\.deb' | sort -u \
+                     | grep -E 'linux-(image-unsigned|modules)-'); do
+            curl -sSO "${base}${f}"
+          done
+          ls -l
+          sudo dpkg -i ./*.deb
+          kver=$(ls /lib/modules | grep -E "^${{ matrix.prefix }}\.[0-9]+-0" | sort -V | tail -1)
+          ls "/lib/modules/${kver}/kernel/drivers/block/"ublk_drv.ko*
+          sudo chmod 644 "/boot/vmlinuz-${kver}"
+          echo "KVER=${kver}" >> "$GITHUB_ENV"
+      - name: Build
+        run: make
+      - name: Run in microVM
+        run: |
+          set -eux
+          rm -f vm-status
+          vng --run "/boot/vmlinuz-${KVER}" --user root --cpus 4 --memory 4G \
+            --rwdir "$PWD" --verbose -- \
+            /bin/bash "$PWD/ci/guest.sh" "${{ matrix.prefix }}" || true
+          echo "guest status: $(cat vm-status 2>/dev/null || echo '<none>')"
+          test "$(cat vm-status)" = "0"
+
   host:
     name: host kernel (ubuntu-26.04)
     runs-on: ubuntu-26.04
