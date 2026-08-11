@@ -21,6 +21,16 @@ if [ -n "$expect" ]; then
 	esac
 fi
 
+# Stop udev: it opens each freshly added /dev/ublkbN to probe it, and if
+# that probe is still in flight when the iteration tears the device down,
+# del_gendisk waits for udev's opener while the opener waits for IO no
+# server is left to serve. That deadlocks STOP_DEV on *every* kernel
+# (seen at iteration ~52 on 6.14) and would masquerade as the bug under
+# test. devtmpfs still creates the device nodes without udev.
+systemctl stop systemd-udevd.service systemd-udevd-kernel.socket \
+	systemd-udevd-control.socket 2>/dev/null || pkill -f udevd || true
+sleep 1
+
 if ! modprobe ublk_drv; then
 	echo "modprobe ublk_drv failed" >&2
 	echo 1 >"$status"

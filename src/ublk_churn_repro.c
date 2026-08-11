@@ -609,6 +609,12 @@ int main(int argc, char **argv)
 			if (bfd >= 0) {
 				static uint8_t blk[4096];
 				(void)!pwrite(bfd, blk, sizeof(blk), 0);
+				// Force the write through the server now: a
+				// buffered write would still be in page cache at
+				// teardown, so its writeback would fail instead of
+				// completing, and the iteration would not have
+				// exercised a real IO at all.
+				(void)!fsync(bfd);
 				close(bfd);
 			}
 		}
