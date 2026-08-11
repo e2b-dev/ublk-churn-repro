@@ -186,16 +186,28 @@ static const char *phase_name(int p)
 	return "?";
 }
 
+// Status file written by the watchdog itself: once the kernel is wedged,
+// a thread can be stuck in D state and process exit never completes, so
+// the caller must not depend on our exit status propagating.
+static const char *g_status_path;
+
 static void on_alarm(int sig)
 {
 	(void)sig;
 	char buf[176];
 	int n = snprintf(buf, sizeof(buf),
 			 "\nWEDGED: iteration %d stuck in %s past the watchdog interval; "
-			 "no CQE for that command -- kernel bug\n",
+			 "no CQE for that command\n",
 			 (int)g_iter, phase_name((int)g_phase));
 	if (n > 0)
 		(void)!write(STDERR_FILENO, buf, (size_t)n);
+	if (g_status_path) {
+		int fd = open(g_status_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+		if (fd >= 0) {
+			(void)!write(fd, "3\n", 2);
+			close(fd);
+		}
+	}
 	_exit(3);
 }
 
@@ -469,6 +481,7 @@ int main(int argc, char **argv)
 {
 	long iters = argc > 1 ? strtol(argv[1], NULL, 10) : 5000;
 	unsigned watchdog_s = argc > 2 ? (unsigned)strtoul(argv[2], NULL, 10) : 30;
+	g_status_path = argc > 3 ? argv[3] : NULL;
 
 	signal(SIGALRM, on_alarm);
 
@@ -580,6 +593,24 @@ int main(int argc, char **argv)
 		if (res < 0) {
 			fprintf(stderr, "iter %ld START_DEV: %s\n", i, strerror(-res));
 			return 1;
+		}
+
+		// One small buffered write through the block device, matching
+		// the real server's churn workload. It also gives udev's probe
+		// of the freshly added disk a moment to finish: tearing the
+		// server down while udev still has /dev/ublkbN open deadlocks
+		// del_gendisk (it waits for the opener; the opener waits for IO
+		// no server is left to serve) on every kernel, which would
+		// masquerade as the bug under test.
+		{
+			char bpath[64];
+			snprintf(bpath, sizeof(bpath), "/dev/ublkb%u", dev_id);
+			int bfd = open(bpath, O_WRONLY | O_CLOEXEC);
+			if (bfd >= 0) {
+				static uint8_t blk[4096];
+				(void)!pwrite(bfd, blk, sizeof(blk), 0);
+				close(bfd);
+			}
 		}
 
 		// Teardown in ublk-go's order: cancel the worker and join it

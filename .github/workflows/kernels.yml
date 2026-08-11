@@ -16,7 +16,7 @@ jobs:
     # runner's rootfs.
     name: kernel ${{ matrix.prefix }} (microVM)
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -75,7 +75,7 @@ jobs:
     # mainline points upstream.
     name: mainline ${{ matrix.tag }} (microVM)
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:

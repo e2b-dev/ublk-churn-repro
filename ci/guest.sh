@@ -30,5 +30,7 @@ fi
 # The watchdog, not the job timeout, is what turns a wedge into a
 # failure: on the affected kernel the guest can stop making progress
 # entirely.
-./ublk_churn_repro 3000 30
+# The watchdog also writes $status itself: once the kernel is wedged a
+# thread can sit in D state and process exit never returns here.
+./ublk_churn_repro 3000 30 "$status"
 echo $? >"$status"
