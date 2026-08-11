@@ -108,8 +108,14 @@ jobs:
           # mainline linux-modules depends on wireless-regdb; install it
           # first so dpkg can configure the packages.
           sudo apt-get install -y --no-install-recommends wireless-regdb
-          sudo dpkg -i ./*.deb
+          # The mainline image postinst trips over an initramfs hook
+          # ("run-parts: missing operand") on this runner image. The
+          # files unpack fine, which is all vng needs, so check for the
+          # artifacts rather than trusting dpkg's exit code.
+          sudo dpkg -i ./*.deb || true
           kver=$(ls /lib/modules | grep -E "^${{ matrix.prefix }}\.[0-9]+-0" | sort -V | tail -1)
+          test -n "$kver"
+          test -f "/boot/vmlinuz-${kver}"
           ls "/lib/modules/${kver}/kernel/drivers/block/"ublk_drv.ko*
           sudo chmod 644 "/boot/vmlinuz-${kver}"
           echo "KVER=${kver}" >> "$GITHUB_ENV"
