@@ -88,9 +88,9 @@
 #define UBLK_MAX_QUEUE_DEPTH 4096
 #define UBLK_IO_DESC_BYTES 24 // sizeof(struct ublksrv_io_desc)
 
-#define QUEUE_DEPTH 32
+#define QUEUE_DEPTH 128
 #define DEV_BYTES (2 * 1024 * 1024)
-#define IO_BUF_BYTES 65536
+#define IO_BUF_BYTES 131072
 
 struct ublksrv_ctrl_cmd {
 	uint32_t dev_id;
