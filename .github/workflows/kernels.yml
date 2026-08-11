@@ -1,0 +1,82 @@
+name: kernels
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  vm:
+    # The ubuntu-24.04 runner's own kernel is an azure build, so each
+    # kernel under test is booted in a virtme-ng microVM that shares the
+    # runner's rootfs.
+    name: kernel ${{ matrix.prefix }} (microVM)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - prefix: "6.8" # noble GA
+            meta: linux-image-generic
+          - prefix: "6.14" # noble HWE series carrying the CVE-2025-37906 fix
+            meta: series
+          - prefix: "7.0" # current noble HWE: expected to wedge
+            meta: linux-image-generic-hwe-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Install virtme-ng and the target kernel
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends virtme-ng qemu-system-x86 virtiofsd
+          pkg="${{ matrix.meta }}"
+          if [ "$pkg" = series ]; then
+            pkg=$(apt-cache pkgnames "linux-image-${{ matrix.prefix }}" \
+              | grep -E "^linux-image-${{ matrix.prefix }}\.[0-9.-]+-generic$" | sort -V | tail -1)
+          fi
+          sudo apt-get install -y --no-install-recommends "$pkg"
+          kver=$(ls /lib/modules | grep -E "^${{ matrix.prefix }}\." | sort -V | tail -1)
+          if ! ls "/lib/modules/${kver}/kernel/drivers/block/"ublk_drv.ko* 2>/dev/null; then
+            sudo apt-get install -y --no-install-recommends "linux-modules-extra-${kver}"
+          fi
+          sudo chmod 644 "/boot/vmlinuz-${kver}"
+          echo "KVER=${kver}" >> "$GITHUB_ENV"
+      - name: Build
+        run: make
+      - name: Run in microVM
+        run: |
+          set -eux
+          # vng flattens and re-parses its command argv and can expand $?
+          # before the guest sees it, so the guest steps live in a script
+          # and the status file it writes is authoritative.
+          rm -f vm-status
+          vng --run "/boot/vmlinuz-${KVER}" --user root --cpus 4 --memory 4G \
+            --rwdir "$PWD" --verbose -- \
+            /bin/bash "$PWD/ci/guest.sh" "${{ matrix.prefix }}" || true
+          echo "guest status: $(cat vm-status 2>/dev/null || echo '<none>')"
+          test "$(cat vm-status)" = "0"
+
+  host:
+    name: host kernel (ubuntu-26.04)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and run
+        run: |
+          set -eux
+          uname -r
+          sudo modprobe ublk_drv
+          make
+          sudo ./ublk_churn_repro 3000 30
