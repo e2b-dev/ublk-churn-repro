@@ -14,7 +14,7 @@ jobs:
     # The ubuntu-24.04 runner's own kernel is an azure build, so each
     # kernel under test is booted in a virtme-ng microVM that shares the
     # runner's rootfs.
-    name: kernel ${{ matrix.prefix }} (microVM)
+    name: kernel ${{ matrix.prefix }}${{ matrix.udev && format(' +{0}', matrix.udev) || '' }} (microVM)
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     strategy:
@@ -27,6 +27,15 @@ jobs:
             meta: series
           - prefix: "7.0" # current noble HWE: expected to wedge
             meta: linux-image-generic-hwe-24.04
+          # Same two kernels with udevd left running, to test whether
+          # udev is the missing ingredient (the Go suite that wedges
+          # runs with it active).
+          - prefix: "6.14"
+            meta: series
+            udev: udev
+          - prefix: "7.0"
+            meta: linux-image-generic-hwe-24.04
+            udev: udev
     steps:
       - uses: actions/checkout@v4
       - name: Enable KVM
@@ -63,7 +72,7 @@ jobs:
           rm -f vm-status
           vng --run "/boot/vmlinuz-${KVER}" --user root --cpus 4 --memory 4G \
             --rwdir "$PWD" --verbose -- \
-            /bin/bash "$PWD/ci/guest.sh" "${{ matrix.prefix }}" || true
+            /bin/bash "$PWD/ci/guest.sh" "${{ matrix.prefix }}" "${{ matrix.udev }}" || true
           echo "guest status: $(cat vm-status 2>/dev/null || echo '<none>')"
           test "$(cat vm-status)" = "0"
 
