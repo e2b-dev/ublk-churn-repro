@@ -50,15 +50,36 @@ sudo ./ublk_churn_repro 20000 30   # iterations, watchdog seconds
 Exit codes: `0` all iterations completed, `1` a command returned an
 error, `3` the watchdog fired (the wedge).
 
+## Status: this reproducer does not yet trigger the bug
+
+As of Aug 2026 it runs **3000 iterations clean on every kernel tested**,
+including ones where the Go server it was reduced from
+(<https://github.com/e2b-dev/ublk-go>, `TestChurnLiveness`) wedges within
+tens of iterations. Matching the Go server's queue count, queue depth,
+max IO size and device flags did not change that. See `REPORT.md` for
+the remaining known differences.
+
+Run it with udevd stopped. udev opens each freshly added `/dev/ublkbN`
+to probe it, and if that probe is in flight at teardown, `del_gendisk`
+waits for udev's opener while the opener waits for IO no server is left
+to serve — deadlocking `STOP_DEV` on every kernel, unaffected ones
+included. `ci/guest.sh` stops udevd for that reason.
+
 ## Known results
+
+C reproducer, udevd stopped, 3000 iterations each:
 
 | Kernel | Result |
 | --- | --- |
-| `7.0.0-28-generic` (noble HWE) | **wedges** — `START_DEV` never completes |
+| `7.0.0-28-generic` (noble HWE) | passes |
+| mainline `v7.0`, `v7.0.12` | passes |
 | `6.14` (noble HWE series) | passes |
-| `6.17.0-7-generic` | passes (1500 iterations, ~21/s) |
-| `6.18` (Ubuntu 26.04) | passes |
-| `6.8.0-137-generic` (noble GA) | passes here, but see note |
+| `6.17.0-7-generic` | passes (also 1500 iterations locally, ~21/s) |
+| `6.8.0-137-generic` (noble GA) | passes, but see note |
+
+For contrast, `TestChurnLiveness` in the Go server, run alone and
+serialized, ten repeats: mainline `6.18.40` wedged 4 of 6 (iterations
+77–200) and `7.0.0-28-generic` wedged 6 of 6 (iterations 12–248).
 
 Note on 6.8: this loop passes, but 6.8 is separately affected by
 CVE-2025-37906 (`ublk: fix race between io_uring_cmd_complete_in_task

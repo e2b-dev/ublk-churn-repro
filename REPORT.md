@@ -45,8 +45,54 @@ harness, so the difference is the kernel, not the environment.
 
 ## Reproducer
 
-Standalone C, raw io_uring, no liburing dependency:
-<https://github.com/e2b-dev/ublk-churn-repro>
+The reliable reproducer is a Go ublk server's integration test:
+
+```sh
+git clone https://github.com/e2b-dev/ublk-go && cd ublk-go/test
+go test -c -race -tags=integration -o /tmp/ublk.test .
+sudo /tmp/ublk.test -test.v -test.run=TestChurnLiveness -test.count=10
+```
+
+It loops create → 4 KiB write → close for 8 s per repeat and reports the
+iteration and phase on a stall. Wedge output:
+
+```
+churn wedged at iteration 118 in stage "New" (1m0s past budget)
+```
+
+### A minimal C server does NOT reproduce it
+
+<https://github.com/e2b-dev/ublk-churn-repro> is a standalone C ublk
+server (raw io_uring, no liburing) performing the same command sequence.
+It ran **3000 iterations clean on every kernel tested**, including the
+ones where the Go server wedges within tens of iterations. That is
+offered as a narrowing clue, not a reproducer.
+
+It was made to match the Go server on everything cheap to match:
+one queue, queue depth 128, 128 KiB max IO, the same device flags
+(`UBLK_F_CMD_IOCTL_ENCODE` plus `UBLK_F_UPDATE_SIZE` when
+`GET_FEATURES` reports it), a worker thread that submits `FETCH_REQ`
+for every tag and services IOs, and the same teardown order. None of
+those changed the outcome.
+
+Known remaining differences, any of which may be the trigger:
+
+- The Go server registers the char fd as an io_uring **fixed file** and
+  submits FETCH/COMMIT with `IOSQE_FIXED_FILE`. The C version cannot:
+  the registration holds a reference to the char device that outlives
+  `close()` of the char fd (dropped only by the ring's async exit work),
+  so `ublk_ch_release` never runs and `DEL_DEV` deadlocks immediately —
+  on every kernel.
+- The Go runtime delivers `SIGURG` preemption signals constantly, so its
+  `io_uring_enter` calls are interrupted and restarted far more often.
+- Its worker runs `LockOSThread` pinned to the queue's CPUs.
+
+udev must be stopped when running the C version: udev opens each freshly
+added `/dev/ublkbN` to probe it, and if that probe is in flight at
+teardown, `del_gendisk` waits for udev's opener while the opener waits
+for IO no server is left to serve. That deadlocks `STOP_DEV` on every
+kernel including unaffected ones, and is a separate userspace-ordering
+issue, not this bug.
 
 ```sh
 sudo modprobe ublk_drv
@@ -54,7 +100,7 @@ make
 sudo ./ublk_churn_repro 5000 30
 ```
 
-Each iteration is a complete device lifecycle: `ADD_DEV`, `SET_PARAMS`,
+Each C iteration is a complete device lifecycle: `ADD_DEV`, `SET_PARAMS`,
 a worker thread that submits `FETCH_REQ` for every tag and services IOs
 with `COMMIT_AND_FETCH_REQ`, `START_DEV`, then worker cancel, char-fd
 close, `STOP_DEV`, `DEL_DEV`. A per-iteration `alarm()` watchdog reports
