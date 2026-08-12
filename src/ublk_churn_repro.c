@@ -84,6 +84,15 @@
 #endif
 
 #define UBLK_F_CMD_IOCTL_ENCODE (1ULL << 6)
+#define UBLK_F_UPDATE_SIZE (1ULL << 10)
+#define UBLK_U_CMD_GET_FEATURES 0x80207513U
+
+#ifndef IORING_REGISTER_FILES
+#define IORING_REGISTER_FILES 2
+#endif
+#ifndef IOSQE_FIXED_FILE
+#define IOSQE_FIXED_FILE (1U << 0)
+#endif
 #define UBLK_PARAM_TYPE_BASIC (1U << 0)
 #define UBLK_MAX_QUEUE_DEPTH 4096
 #define UBLK_IO_DESC_BYTES 24 // sizeof(struct ublksrv_io_desc)
@@ -367,6 +376,13 @@ static void *worker_fn(void *p)
 	if (descs == MAP_FAILED)
 		goto fail;
 
+	// NOTE: the real server registers the char fd as a fixed file and
+	// submits with IOSQE_FIXED_FILE. Tried here and reverted: the
+	// registration keeps a reference to the char device that outlives
+	// close(cfd) (it is dropped by the ring's async exit work), so
+	// ublk_ch_release never runs and DEL_DEV deadlocks on iteration 0
+	// -- on every kernel, including unaffected ones.
+
 	for (int tag = 0; tag < QUEUE_DEPTH; tag++) {
 		struct sqe128 *sqe = get_sqe(&data);
 		sqe->opcode = IORING_OP_URING_CMD;
@@ -493,6 +509,27 @@ int main(int argc, char **argv)
 	if (setup_ring(&ctrl, 8) < 0)
 		die("setup control io_uring");
 
+	// Match the real server's device flags: it queries GET_FEATURES and
+	// advertises UBLK_F_UPDATE_SIZE whenever the kernel has it, so
+	// without this the two are not even creating the same kind of
+	// device.
+	uint64_t features = 0;
+	{
+		struct ublksrv_ctrl_cmd gf;
+		memset(&gf, 0, sizeof(gf));
+		gf.dev_id = UINT32_MAX;
+		gf.queue_id = UINT16_MAX;
+		gf.addr = (uintptr_t)&features;
+		gf.len = sizeof(features);
+		if (ctrl_cmd(&ctrl, ctrl_fd, UBLK_U_CMD_GET_FEATURES, &gf) < 0)
+			features = 0;
+	}
+	uint64_t dev_flags = UBLK_F_CMD_IOCTL_ENCODE;
+	if (features & UBLK_F_UPDATE_SIZE)
+		dev_flags |= UBLK_F_UPDATE_SIZE;
+	printf("kernel features 0x%llx, device flags 0x%llx\n",
+	       (unsigned long long)features, (unsigned long long)dev_flags);
+
 	struct timespec t0;
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 
@@ -507,7 +544,7 @@ int main(int argc, char **argv)
 		info.queue_depth = QUEUE_DEPTH;
 		info.max_io_buf_bytes = IO_BUF_BYTES;
 		info.dev_id = UINT32_MAX;
-		info.flags = UBLK_F_CMD_IOCTL_ENCODE;
+		info.flags = dev_flags;
 		struct ublksrv_ctrl_cmd add;
 		memset(&add, 0, sizeof(add));
 		add.dev_id = UINT32_MAX;
