@@ -76,6 +76,89 @@ jobs:
           echo "guest status: $(cat vm-status 2>/dev/null || echo '<none>')"
           test "$(cat vm-status)" = "0"
 
+  ublksrv:
+    # The decisive test: churn the upstream reference server
+    # (ublk-org/ublksrv, by the ublk maintainer) instead of ublk-go. If
+    # this wedges, the bug is in the kernel, not in any one server.
+    name: ublksrv churn on ${{ matrix.prefix }} (microVM)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - prefix: "6.8"
+            meta: linux-image-generic
+          - prefix: "6.14"
+            meta: series
+          - prefix: "6.18"
+            meta: mainline
+          - prefix: "7.0"
+            meta: linux-image-generic-hwe-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Install virtme-ng and the target kernel
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends virtme-ng qemu-system-x86 virtiofsd
+          pkg="${{ matrix.meta }}"
+          if [ "$pkg" = series ]; then
+            pkg=$(apt-cache pkgnames "linux-image-${{ matrix.prefix }}" \
+              | grep -E "^linux-image-${{ matrix.prefix }}\.[0-9.-]+-generic$" | sort -V | tail -1)
+          fi
+          if [ "$pkg" = mainline ]; then
+            base=https://kernel.ubuntu.com/mainline/
+            tag=$(curl -sS "$base" | grep -oE "v${{ matrix.prefix }}\.[0-9]+/" \
+              | sort -uV | tail -1 | tr -d /)
+            mkdir -p /tmp/ml && cd /tmp/ml
+            for f in $(curl -sS "${base}${tag}/amd64/" | grep -oE '[a-z0-9._+-]+\.deb' \
+                       | sort -u | grep -E 'linux-(image-unsigned|modules)-'); do
+              curl -sSO "${base}${tag}/amd64/${f}"
+            done
+            sudo apt-get install -y --no-install-recommends wireless-regdb
+            sudo dpkg -i ./*.deb || true
+            cd -
+          else
+            sudo apt-get install -y --no-install-recommends "$pkg"
+          fi
+          kver=$(ls /lib/modules | grep -E "^${{ matrix.prefix }}\." | sort -V | tail -1)
+          test -n "$kver"
+          if ! ls "/lib/modules/${kver}/kernel/drivers/block/"ublk_drv.ko* 2>/dev/null; then
+            sudo apt-get install -y --no-install-recommends "linux-modules-extra-${kver}" || true
+          fi
+          ls "/lib/modules/${kver}/kernel/drivers/block/"ublk_drv.ko*
+          test -f "/boot/vmlinuz-${kver}"
+          sudo chmod 644 "/boot/vmlinuz-${kver}"
+          echo "KVER=${kver}" >> "$GITHUB_ENV"
+      - name: Build ublksrv (upstream reference server)
+        run: |
+          set -eux
+          sudo apt-get install -y --no-install-recommends \
+            liburing-dev autoconf automake libtool pkg-config g++ make
+          git clone --depth 1 https://github.com/ublk-org/ublksrv
+          cd ublksrv
+          git log --oneline -1
+          autoreconf -i
+          ./configure
+          make -j"$(nproc)"
+          test -x ublk && test -x .libs/ublk
+      - name: Churn ublksrv in the microVM
+        run: |
+          set -eux
+          rm -f vm-status
+          vng --run "/boot/vmlinuz-${KVER}" --user root --cpus 4 --memory 4G \
+            --rwdir "$PWD" --verbose -- \
+            /bin/bash "$PWD/ci/ublksrv-guest.sh" "${{ matrix.prefix }}" 600 || true
+          echo "guest status: $(cat vm-status 2>/dev/null || echo '<none>')"
+          test "$(cat vm-status)" = "0"
+
   mainline:
     # Is the 7.0 wedge upstream, or Ubuntu-specific? Ubuntu's own
     # mainline builds are vanilla kernel.org trees with no Ubuntu
