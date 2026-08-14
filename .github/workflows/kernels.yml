@@ -115,8 +115,17 @@ jobs:
           fi
           if [ "$pkg" = mainline ]; then
             base=https://kernel.ubuntu.com/mainline/
-            tag=$(curl -sS "$base" | grep -oE "v${{ matrix.prefix }}\.[0-9]+/" \
-              | sort -uV | tail -1 | tr -d /)
+            # Newest tag that actually has binaries: some build dirs
+            # exist but are empty (v6.18.44 at time of writing).
+            tag=""
+            for t in $(curl -sS "$base" | grep -oE "v${{ matrix.prefix }}(\.[0-9]+)?/" \
+                       | sort -urV | tr -d /); do
+              if curl -sS "${base}${t}/amd64/" | grep -q 'linux-image-unsigned.*\.deb'; then
+                tag="$t"; break
+              fi
+            done
+            test -n "$tag"
+            echo "using mainline $tag"
             mkdir -p /tmp/ml && cd /tmp/ml
             for f in $(curl -sS "${base}${tag}/amd64/" | grep -oE '[a-z0-9._+-]+\.deb' \
                        | sort -u | grep -E 'linux-(image-unsigned|modules)-'); do
