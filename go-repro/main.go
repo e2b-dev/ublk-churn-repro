@@ -46,6 +46,7 @@ const (
 	cmdStartDev    = 0xC0207506
 	cmdStopDev     = 0xC0207507
 	cmdSetParams   = 0xC0207508
+	cmdGetQueueAff = 0x80207501
 
 	ioFetchReq          = 0xC0107520
 	ioCommitAndFetchReq = 0xC0107521
@@ -477,6 +478,21 @@ func iteration(i int64, devFlags uint64) error {
 		return err
 	} else if res < 0 {
 		return fmt.Errorf("SET_PARAMS: %w", unix.Errno(-res))
+	}
+
+	// ublk-go asks for the queue's CPU mask between SET_PARAMS and
+	// START_DEV. It matters here for its ordering, not its answer: 7.0
+	// runs GET_QUEUE_AFFINITY inline while ADD_DEV, SET_PARAMS and
+	// START_DEV are punted to io-wq, so ublk-go interleaves an inline
+	// command between punted ones and this program did not.
+	// REPRO_NO_QAFF=1 drops it.
+	var cpuMask [128]byte
+	if os.Getenv("REPRO_NO_QAFF") == "" {
+		qa := ctrlCmd{DevID: devID, QueueID: 0,
+			Len: uint16(len(cpuMask)), Addr: uint64(uintptr(unsafe.Pointer(&cpuMask[0])))}
+		if _, err := ctrl(r, ctrlFD, cmdGetQueueAff, &qa); err != nil {
+			return err
+		}
 	}
 
 	phase("start-worker")
