@@ -43,6 +43,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
@@ -86,6 +87,8 @@
 #define UBLK_F_CMD_IOCTL_ENCODE (1ULL << 6)
 #define UBLK_F_UPDATE_SIZE (1ULL << 10)
 #define UBLK_U_CMD_GET_FEATURES 0x80207513U
+// _IOR('u', 0x01, struct ublksrv_ctrl_cmd)
+#define UBLK_U_CMD_GET_QUEUE_AFFINITY 0x80207501U
 
 #ifndef IORING_REGISTER_FILES
 #define IORING_REGISTER_FILES 2
@@ -182,6 +185,14 @@ struct ring {
 	// control ring per device, so this program must be able to as well.
 	void *sq_base, *cq_base, *sqe_base;
 	size_t sq_sz, cq_sz, sqe_sz;
+	// ublk-go's Ring.setupCancel(): an eventfd plus a private epoll
+	// instance holding *the io_uring fd itself* and that eventfd. The
+	// hot path never touches them (its worker waits in io_uring_enter
+	// and cancels through an in-ring POLL_ADD, like this program), but
+	// the registration exists for every ring, control ring included.
+	// It is the last structural thing ublk-go does that the clean C and
+	// Go reproducers do not. REPRO_NO_EPOLL=1 leaves it out.
+	int cancel_evfd, epfd;
 };
 
 static volatile sig_atomic_t g_iter;
@@ -268,11 +279,35 @@ static int setup_ring(struct ring *r, unsigned entries)
 	r->sq_sz = sq_sz;
 	r->cq_sz = cq_sz;
 	r->sqe_sz = sqe_sz;
+
+	r->cancel_evfd = -1;
+	r->epfd = -1;
+	if (!getenv("REPRO_NO_EPOLL")) {
+		r->cancel_evfd = eventfd(0, EFD_CLOEXEC);
+		if (r->cancel_evfd < 0)
+			return -1;
+		r->epfd = epoll_create1(EPOLL_CLOEXEC);
+		if (r->epfd < 0)
+			return -1;
+		int fds[2] = { r->fd, r->cancel_evfd };
+		for (int i = 0; i < 2; i++) {
+			struct epoll_event ev;
+			memset(&ev, 0, sizeof(ev));
+			ev.events = EPOLLIN;
+			ev.data.fd = fds[i];
+			if (epoll_ctl(r->epfd, EPOLL_CTL_ADD, fds[i], &ev) < 0)
+				return -1;
+		}
+	}
 	return 0;
 }
 
 static void ring_close(struct ring *r)
 {
+	if (r->epfd >= 0)
+		close(r->epfd);
+	if (r->cancel_evfd >= 0)
+		close(r->cancel_evfd);
 	if (r->sq_base)
 		munmap(r->sq_base, r->sq_sz);
 	if (r->cq_base)
@@ -358,6 +393,8 @@ struct ublksrv_io_desc {
 // completed by this loop before START_DEV can return. A worker that
 // only waits deadlocks the kernel's add_disk in read_part_sector.
 struct worker_arg {
+	cpu_set_t qset;
+	int have_affinity;
 	int cfd;
 	int cancel_fd; // eventfd; a write breaks the worker out of enter
 	atomic_int ready;
@@ -396,12 +433,14 @@ static int g_shared_ctrl;
 static void *worker_fn(void *p)
 {
 	struct worker_arg *wa = p;
+	if (wa->have_affinity)
+		(void)!pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &wa->qset);
 	struct ring data;
 	uint8_t *bufs = NULL;
 	void *descs = MAP_FAILED;
 	size_t desc_bytes = (size_t)QUEUE_DEPTH * UBLK_IO_DESC_BYTES;
 
-	if (setup_ring(&data, QUEUE_DEPTH * 4) < 0)
+	if (setup_ring(&data, QUEUE_DEPTH * 2) < 0) // ublk-go: roundUp2(depth+1) = 256
 		goto fail;
 
 	bufs = malloc((size_t)QUEUE_DEPTH * IO_BUF_BYTES);
@@ -546,7 +585,7 @@ int main(int argc, char **argv)
 		die("open /dev/ublk-control");
 
 	struct ring ctrl;
-	if (setup_ring(&ctrl, 8) < 0)
+	if (setup_ring(&ctrl, 4) < 0)
 		die("setup control io_uring");
 
 	// Match the real server's device flags: it queries GET_FEATURES and
@@ -627,7 +666,7 @@ static void *iteration_fn(void *p)
 		ctrl_fd = open("/dev/ublk-control", O_RDWR | O_CLOEXEC);
 		if (ctrl_fd < 0)
 			die("open /dev/ublk-control");
-		if (setup_ring(&own, 8) < 0)
+		if (setup_ring(&own, 4) < 0)
 			die("setup control io_uring");
 		ctrlp = &own;
 	}
@@ -692,11 +731,29 @@ static void *iteration_fn(void *p)
 			goto fail;
 		}
 
-		// Start the worker; wait until it has submitted its fetches.
+			// ublk-go queries the queue's affinity and pins its worker
+		// thread to those CPUs. REPRO_NO_AFFINITY=1 skips both.
+		cpu_set_t qset;
+		int have_affinity = 0;
+		if (!getenv("REPRO_NO_AFFINITY")) {
+			CPU_ZERO(&qset);
+			struct ublksrv_ctrl_cmd aff;
+			memset(&aff, 0, sizeof(aff));
+			aff.dev_id = dev_id;
+			aff.queue_id = 0;
+			aff.addr = (uintptr_t)&qset;
+			aff.len = sizeof(qset);
+			if (ctrl_cmd(&ctrl, ctrl_fd, UBLK_U_CMD_GET_QUEUE_AFFINITY, &aff) >= 0)
+				have_affinity = 1;
+		}
+
+	// Start the worker; wait until it has submitted its fetches.
 		int cancel_fd = eventfd(0, EFD_CLOEXEC);
 		if (cancel_fd < 0)
 			die("eventfd");
 		struct worker_arg wa;
+		wa.qset = qset;
+		wa.have_affinity = have_affinity;
 		wa.cfd = cfd;
 		wa.cancel_fd = cancel_fd;
 		atomic_init(&wa.ready, 0);
@@ -745,12 +802,11 @@ static void *iteration_fn(void *p)
 			if (bfd >= 0) {
 				static uint8_t blk[4096];
 				(void)!pwrite(bfd, blk, sizeof(blk), 0);
-				// Force the write through the server now: a
-				// buffered write would still be in page cache at
-				// teardown, so its writeback would fail instead of
-				// completing, and the iteration would not have
-				// exercised a real IO at all.
-				(void)!fsync(bfd);
+				// ublk-go's churn test leaves this dirty on
+				// purpose, so writeback races Close. REPRO_FSYNC=1
+				// restores the flush.
+				if (getenv("REPRO_FSYNC"))
+					(void)!fsync(bfd);
 				close(bfd);
 			}
 		}
