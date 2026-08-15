@@ -51,5 +51,13 @@ fi
 # entirely.
 # The watchdog also writes $status itself: once the kernel is wedged a
 # thread can sit in D state and process exit never returns here.
-./ublk_churn_repro 3000 30 "$status"
-echo $? >"$status"
+# $3 picks the implementation. The Go port runs the identical syscall
+# sequence with no ublk-go dependency, to tell "the Go runtime" apart
+# from "the ublk-go library" as the missing ingredient.
+if [ "${3:-c}" = go ]; then
+	./go-repro/ublk_churn_repro_go 3000 30
+	echo $? >"$status"
+else
+	./ublk_churn_repro 3000 30 "$status"
+	echo $? >"$status"
+fi
