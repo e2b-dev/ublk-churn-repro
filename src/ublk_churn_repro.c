@@ -247,6 +247,9 @@ static int setup_ring(struct ring *r, unsigned entries)
 	memset(&p, 0, sizeof(p));
 	p.flags = IORING_SETUP_SQE128;
 	memset(r, 0, sizeof(*r));
+	r->fd = -1;
+	r->cancel_evfd = -1;
+	r->epfd = -1;
 
 	r->fd = syscall(__NR_io_uring_setup, entries, &p);
 	if (r->fd < 0)
@@ -318,6 +321,8 @@ static void ring_close(struct ring *r)
 		close(r->fd);
 	memset(r, 0, sizeof(*r));
 	r->fd = -1;
+	r->cancel_evfd = -1;
+	r->epfd = -1;
 }
 
 static struct sqe128 *get_sqe(struct ring *r)
