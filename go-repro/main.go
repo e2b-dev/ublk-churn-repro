@@ -170,7 +170,12 @@ type cqRingOffsets struct {
 }
 
 type ring struct {
-	fd                      int
+	fd int
+	// ublk-go's Ring.setupCancel: an eventfd plus a private epoll
+	// holding the io_uring fd itself. Unused in the hot path there too
+	// (its worker waits in io_uring_enter and cancels through an in-ring
+	// POLL_ADD), but present on every ring. REPRO_NO_EPOLL=1 omits it.
+	cancelEvFD, epFD        int
 	sqTail, sqMask, sqArray *uint32
 	cqHead, cqTail, cqMask  *uint32
 	cqes                    unsafe.Pointer
@@ -186,7 +191,25 @@ func setupRing(entries uint32) (*ring, error) {
 	if errno != 0 {
 		return nil, fmt.Errorf("io_uring_setup: %w", errno)
 	}
-	r := &ring{fd: int(fd)}
+	r := &ring{fd: int(fd), cancelEvFD: -1, epFD: -1}
+	if os.Getenv("REPRO_NO_EPOLL") == "" {
+		efd, err := unix.Eventfd(0, unix.EFD_CLOEXEC)
+		if err != nil {
+			return nil, fmt.Errorf("eventfd: %w", err)
+		}
+		r.cancelEvFD = efd
+		epfd, err := unix.EpollCreate1(unix.EPOLL_CLOEXEC)
+		if err != nil {
+			return nil, fmt.Errorf("epoll_create1: %w", err)
+		}
+		r.epFD = epfd
+		for _, fd := range []int{r.fd, r.cancelEvFD} {
+			ev := unix.EpollEvent{Events: unix.EPOLLIN, Fd: int32(fd)}
+			if err := unix.EpollCtl(r.epFD, unix.EPOLL_CTL_ADD, fd, &ev); err != nil {
+				return nil, fmt.Errorf("epoll_ctl: %w", err)
+			}
+		}
+	}
 
 	sqSz := int(p.SqOff.Array + p.SqEntries*4)
 	cqSz := int(p.CqOff.Cqes + p.CqEntries*uint32(unsafe.Sizeof(cqe{})))
@@ -223,6 +246,12 @@ func setupRing(entries uint32) (*ring, error) {
 }
 
 func (r *ring) close() {
+	if r.epFD >= 0 {
+		unix.Close(r.epFD)
+	}
+	if r.cancelEvFD >= 0 {
+		unix.Close(r.cancelEvFD)
+	}
 	unix.Munmap(r.sqBase)
 	unix.Munmap(r.cqBase)
 	unix.Munmap(r.sqeBase)
@@ -296,7 +325,7 @@ func worker(wa *workerArg) {
 	runtime.LockOSThread()
 	defer close(wa.done)
 
-	r, err := setupRing(queueDepth + 8)
+	r, err := setupRing(queueDepth + 1)
 	if err != nil {
 		wa.setupErr = fmt.Errorf("worker ring: %w", err)
 		wa.failed.Store(true)
@@ -389,7 +418,7 @@ func iteration(i int64, devFlags uint64) error {
 	}
 	defer unix.Close(ctrlFD)
 
-	r, err := setupRing(8)
+	r, err := setupRing(4)
 	if err != nil {
 		return err
 	}
@@ -545,7 +574,7 @@ func main() {
 		fmt.Println("open /dev/ublk-control:", err)
 		os.Exit(1)
 	}
-	r, err := setupRing(8)
+	r, err := setupRing(4)
 	if err != nil {
 		fmt.Println(err)
 		os.Exit(1)
