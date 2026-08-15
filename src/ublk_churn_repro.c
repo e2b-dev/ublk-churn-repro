@@ -178,6 +178,10 @@ struct ring {
 	struct io_uring_cqe *cqes;
 	struct sqe128 *sqes;
 	uint32_t sq_local_tail;
+	// Kept so the ring can be torn down: ublk-go creates a fresh
+	// control ring per device, so this program must be able to as well.
+	void *sq_base, *cq_base, *sqe_base;
+	size_t sq_sz, cq_sz, sqe_sz;
 };
 
 static volatile sig_atomic_t g_iter;
@@ -258,7 +262,27 @@ static int setup_ring(struct ring *r, unsigned entries)
 	r->cq_mask = (uint32_t *)((char *)cq + p.cq_off.ring_mask);
 	r->cqes = (struct io_uring_cqe *)((char *)cq + p.cq_off.cqes);
 	r->sqes = (struct sqe128 *)sqe;
+	r->sq_base = sq;
+	r->cq_base = cq;
+	r->sqe_base = sqe;
+	r->sq_sz = sq_sz;
+	r->cq_sz = cq_sz;
+	r->sqe_sz = sqe_sz;
 	return 0;
+}
+
+static void ring_close(struct ring *r)
+{
+	if (r->sq_base)
+		munmap(r->sq_base, r->sq_sz);
+	if (r->cq_base)
+		munmap(r->cq_base, r->cq_sz);
+	if (r->sqe_base)
+		munmap(r->sqe_base, r->sqe_sz);
+	if (r->fd >= 0)
+		close(r->fd);
+	memset(r, 0, sizeof(*r));
+	r->fd = -1;
 }
 
 static struct sqe128 *get_sqe(struct ring *r)
@@ -353,6 +377,21 @@ static int reap(struct ring *r, int32_t *res, uint64_t *ud)
 	__atomic_store_n(r->cq_head, head + 1, __ATOMIC_RELEASE);
 	return 0;
 }
+
+struct iter_arg {
+	long i;
+	uint64_t dev_flags;
+	unsigned watchdog_s;
+	struct ring *ctrl;  // shared-ctrl mode only
+	int ctrl_fd;        // shared-ctrl mode only
+	int rc;
+};
+
+static void *iteration_fn(void *p);
+
+// REPRO_SHARED_CTRL=1 restores the original shape (one control ring on
+// the process's first thread) for an A/B against ublk-go's.
+static int g_shared_ctrl;
 
 static void *worker_fn(void *p)
 {
@@ -500,6 +539,7 @@ int main(int argc, char **argv)
 	g_status_path = argc > 3 ? argv[3] : NULL;
 
 	signal(SIGALRM, on_alarm);
+	g_shared_ctrl = getenv("REPRO_SHARED_CTRL") != NULL;
 
 	int ctrl_fd = open("/dev/ublk-control", O_RDWR | O_CLOEXEC);
 	if (ctrl_fd < 0)
@@ -533,7 +573,66 @@ int main(int argc, char **argv)
 	struct timespec t0;
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 
+	struct iter_arg ia = { .dev_flags = dev_flags, .watchdog_s = watchdog_s };
 	for (long i = 0; i < iters; i++) {
+		ia.i = i;
+		ia.rc = 0;
+		if (g_shared_ctrl) {
+			// Original shape: every control command from the
+			// process's first thread, on one ring reused forever.
+			ia.ctrl = &ctrl;
+			ia.ctrl_fd = ctrl_fd;
+			(void)iteration_fn(&ia);
+		} else {
+			// ublk-go's shape (confirmed by strace): a fresh
+			// control fd and ring per device, driven by a thread
+			// that is new every iteration -- its worker takes
+			// over the previous thread via LockOSThread, so the
+			// goroutine issuing control commands lands on a new
+			// one each time. That means a new io_uring task
+			// context, and a cold io-wq, per device.
+			pthread_t it;
+			if (pthread_create(&it, NULL, iteration_fn, &ia) != 0)
+				die("pthread_create iteration");
+			pthread_join(it, NULL);
+		}
+		if (ia.rc)
+			return ia.rc;
+
+		if ((i + 1) % 200 == 0) {
+			struct timespec now;
+			clock_gettime(CLOCK_MONOTONIC, &now);
+			double el = (now.tv_sec - t0.tv_sec) + (now.tv_nsec - t0.tv_nsec) / 1e9;
+			printf("iter %ld/%ld ok (%.0f/s)\n", i + 1, iters, (i + 1) / el);
+			fflush(stdout);
+		}
+	}
+
+	printf("PASS: %ld create/start/stop iterations completed without a wedge\n", iters);
+	return 0;
+}
+
+
+static void *iteration_fn(void *p)
+{
+	struct iter_arg *ia = p;
+	long i = ia->i;
+	unsigned watchdog_s = ia->watchdog_s;
+	uint64_t dev_flags = ia->dev_flags;
+	struct ring own;
+	struct ring *ctrlp = ia->ctrl;
+	int ctrl_fd = ia->ctrl_fd;
+
+	if (!ctrlp) {
+		ctrl_fd = open("/dev/ublk-control", O_RDWR | O_CLOEXEC);
+		if (ctrl_fd < 0)
+			die("open /dev/ublk-control");
+		if (setup_ring(&own, 8) < 0)
+			die("setup control io_uring");
+		ctrlp = &own;
+	}
+#define ctrl (*ctrlp)
+	{
 		g_iter = (sig_atomic_t)i;
 
 		g_phase = 0;
@@ -554,7 +653,7 @@ int main(int argc, char **argv)
 		int res = ctrl_cmd(&ctrl, ctrl_fd, UBLK_U_CMD_ADD_DEV, &add);
 		if (res < 0) {
 			fprintf(stderr, "iter %ld ADD_DEV: %s\n", i, strerror(-res));
-			return 1;
+			goto fail;
 		}
 		uint32_t dev_id = info.dev_id;
 
@@ -590,7 +689,7 @@ int main(int argc, char **argv)
 		res = ctrl_cmd(&ctrl, ctrl_fd, UBLK_U_CMD_SET_PARAMS, &sp);
 		if (res < 0) {
 			fprintf(stderr, "iter %ld SET_PARAMS: %s\n", i, strerror(-res));
-			return 1;
+			goto fail;
 		}
 
 		// Start the worker; wait until it has submitted its fetches.
@@ -616,7 +715,7 @@ int main(int argc, char **argv)
 				fprintf(stderr, "iter %ld worker setup failed\n", i);
 			pthread_join(th, NULL);
 			close(cancel_fd);
-			return 1;
+			goto fail;
 		}
 
 		g_phase = 2;
@@ -629,7 +728,7 @@ int main(int argc, char **argv)
 		res = ctrl_cmd(&ctrl, ctrl_fd, UBLK_U_CMD_START_DEV, &start);
 		if (res < 0) {
 			fprintf(stderr, "iter %ld START_DEV: %s\n", i, strerror(-res));
-			return 1;
+			goto fail;
 		}
 
 		// One small buffered write through the block device, matching
@@ -676,7 +775,7 @@ int main(int argc, char **argv)
 		res = ctrl_cmd(&ctrl, ctrl_fd, UBLK_U_CMD_STOP_DEV, &stop);
 		if (res < 0 && res != -EBUSY) {
 			fprintf(stderr, "iter %ld STOP_DEV: %s\n", i, strerror(-res));
-			return 1;
+			goto fail;
 		}
 
 		g_phase = 4;
@@ -688,19 +787,23 @@ int main(int argc, char **argv)
 		res = ctrl_cmd(&ctrl, ctrl_fd, UBLK_U_CMD_DEL_DEV, &del);
 		if (res < 0) {
 			fprintf(stderr, "iter %ld DEL_DEV: %s\n", i, strerror(-res));
-			return 1;
+			goto fail;
 		}
 		alarm(0);
-
-		if ((i + 1) % 200 == 0) {
-			struct timespec now;
-			clock_gettime(CLOCK_MONOTONIC, &now);
-			double el = (now.tv_sec - t0.tv_sec) + (now.tv_nsec - t0.tv_nsec) / 1e9;
-			printf("iter %ld/%ld ok (%.0f/s)\n", i + 1, iters, (i + 1) / el);
-			fflush(stdout);
-		}
 	}
+#undef ctrl
+	if (!ia->ctrl)
+		ring_close(&own);
+	if (!ia->ctrl && ctrl_fd >= 0)
+		close(ctrl_fd);
+	return NULL;
 
-	printf("PASS: %ld create/start/stop iterations completed without a wedge\n", iters);
-	return 0;
+fail:
+#undef ctrl
+	ia->rc = 1;
+	if (!ia->ctrl)
+		ring_close(&own);
+	if (!ia->ctrl && ctrl_fd >= 0)
+		close(ctrl_fd);
+	return NULL;
 }
