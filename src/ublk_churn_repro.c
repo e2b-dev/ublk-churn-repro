@@ -554,7 +554,10 @@ static void *worker_fn(void *p)
 			break;
 	}
 
-	close(data.fd);
+	// ring_close, not close(fd): the ring owns an eventfd and an epoll
+	// instance too, and leaking those exhausts the fd table in ~500
+	// iterations ("worker setup failed" at iter 505).
+	ring_close(&data);
 	if (descs != MAP_FAILED)
 		munmap(descs, desc_bytes);
 	free(bufs);
@@ -564,7 +567,7 @@ fail:
 	atomic_store(&wa->fail, 1);
 	atomic_store(&wa->ready, 1);
 	if (data.fd > 0)
-		close(data.fd);
+		ring_close(&data);
 	if (descs != MAP_FAILED)
 		munmap(descs, desc_bytes);
 	free(bufs);
