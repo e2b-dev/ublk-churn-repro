@@ -395,6 +395,20 @@ func iteration(i int64, devFlags uint64) error {
 	}
 	defer r.close()
 
+	// ublk-go asks the kernel for its features on every device, so on
+	// each fresh control ring the first command is GET_FEATURES -- which
+	// 7.0 runs inline -- and ADD_DEV is the first one punted to io-wq.
+	// REPRO_NO_PER_DEV_FEATURES=1 drops it, which is what the C
+	// reproducer and the original port do.
+	if os.Getenv("REPRO_NO_PER_DEV_FEATURES") == "" {
+		var f uint64
+		gf := ctrlCmd{DevID: ^uint32(0), QueueID: ^uint16(0), Len: 8,
+			Addr: uint64(uintptr(unsafe.Pointer(&f)))}
+		if _, err := ctrl(r, ctrlFD, cmdGetFeatures, &gf); err != nil {
+			return err
+		}
+	}
+
 	phase("ADD_DEV")
 	info := devInfo{
 		NrHwQueues: 1, QueueDepth: queueDepth, MaxIOBufBytes: ioBufBytes,
