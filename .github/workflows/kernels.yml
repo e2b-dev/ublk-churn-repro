@@ -118,8 +118,12 @@ jobs:
             # Newest tag that actually has binaries: some build dirs
             # exist but are empty (v6.18.44 at time of writing).
             tag=""
+            # Strip the slash *before* sorting: sort -V ranks "v6.18/"
+            # above "v6.18.40/" (it compares '/' against '.'), so this
+            # was pinned to the series base release -- the one 6.18 that
+            # does not reproduce.
             for t in $(curl -sS "$base" | grep -oE "v${{ matrix.prefix }}(\.[0-9]+)?/" \
-                       | sort -urV | tr -d /); do
+                       | tr -d / | sort -urV); do
               if curl -sS "${base}${t}/amd64/" | grep -q 'linux-image-unsigned.*\.deb'; then
                 tag="$t"; break
               fi
@@ -184,6 +188,15 @@ jobs:
           - tag: v7.0 # what noble's hwe-7.0 is based on
             prefix: "7.0"
           - tag: v7.0.12 # newest 7.0 stable, in case it is already fixed
+            prefix: "7.0"
+          # The two releases ublk-go is now measured to hang on: 6.18.40
+          # wedges its churn test outright and 7.0.14 measures 5 wedges
+          # in 10 runs, while 6.18.0 and 6.17 are clean. If this
+          # reproducer stays clean on these, the missing ingredient is
+          # in the server, not the kernel.
+          - tag: v6.18.40
+            prefix: "6.18"
+          - tag: v7.0.14
             prefix: "7.0"
     steps:
       - uses: actions/checkout@v4
