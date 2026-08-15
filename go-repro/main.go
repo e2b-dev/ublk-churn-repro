@@ -192,6 +192,12 @@ func setupRing(entries uint32) (*ring, error) {
 		return nil, fmt.Errorf("io_uring_setup: %w", errno)
 	}
 	r := &ring{fd: int(fd), cancelEvFD: -1, epFD: -1}
+	success := false
+	defer func() {
+		if !success {
+			r.close()
+		}
+	}()
 	if os.Getenv("REPRO_NO_EPOLL") == "" {
 		efd, err := unix.Eventfd(0, unix.EFD_CLOEXEC)
 		if err != nil {
@@ -242,6 +248,7 @@ func setupRing(entries uint32) (*ring, error) {
 		*(*uint32)(unsafe.Add(unsafe.Pointer(r.sqArray), uintptr(i)*4)) = i
 	}
 	r.localTail = atomic.LoadUint32(r.sqTail)
+	success = true
 	return r, nil
 }
 
