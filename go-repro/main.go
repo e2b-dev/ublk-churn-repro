@@ -344,6 +344,21 @@ func worker(wa *workerArg) {
 		wa.ready.Store(true)
 		return
 	}
+	// Drain any immediate completions. A fetch erroring out immediately
+	// (bad ABI, device gone) would otherwise look like a START_DEV wedge,
+	// since the kernel holds START_DEV until fetches are ready.
+	for {
+		ud, res, ok := r.reap()
+		if !ok {
+			break
+		}
+		if res < 0 && ud != cancelUserData {
+			wa.fetchRes.Store(res)
+			wa.failed.Store(true)
+			wa.ready.Store(true)
+			return
+		}
+	}
 	wa.ready.Store(true)
 
 	for {
@@ -499,6 +514,7 @@ func iteration(i int64, devFlags uint64) error {
 func main() {
 	iters := int64(3000)
 	watchdog := 30 * time.Second
+	statusPath := ""
 	if len(os.Args) > 1 {
 		if n, err := strconv.ParseInt(os.Args[1], 10, 64); err == nil {
 			iters = n
@@ -508,6 +524,9 @@ func main() {
 		if n, err := strconv.Atoi(os.Args[2]); err == nil {
 			watchdog = time.Duration(n) * time.Second
 		}
+	}
+	if len(os.Args) > 3 {
+		statusPath = os.Args[3]
 	}
 	phaseNow.Store("init")
 
@@ -521,6 +540,9 @@ func main() {
 			case <-time.After(watchdog):
 				fmt.Printf("WEDGE: iteration %d stuck in %v for %v\n",
 					iterNow.Load(), phaseNow.Load(), watchdog)
+				if statusPath != "" {
+					_ = os.WriteFile(statusPath, []byte("3\n"), 0644)
+				}
 				os.Exit(3)
 			}
 		}

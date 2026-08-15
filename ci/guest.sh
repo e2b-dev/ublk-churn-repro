@@ -55,7 +55,7 @@ fi
 # sequence with no ublk-go dependency, to tell "the Go runtime" apart
 # from "the ublk-go library" as the missing ingredient.
 if [ "${3:-c}" = go ]; then
-	./go-repro/ublk_churn_repro_go 3000 30
+	./go-repro/ublk_churn_repro_go 3000 30 "$status"
 	echo $? >"$status"
 else
 	./ublk_churn_repro 3000 30 "$status"
