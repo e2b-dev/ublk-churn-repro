@@ -178,7 +178,7 @@ jobs:
     # patches, so a clean mainline v7.0 next to a wedging
     # 7.0.0-28-generic points at Ubuntu's backports, and a wedging
     # mainline points upstream.
-    name: mainline ${{ matrix.tag }} (microVM)
+    name: mainline ${{ matrix.tag }}${{ matrix.impl == 'go' && ' [go]' || '' }}${{ matrix.split && ' [split-ctrl]' || '' }} (microVM)
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     strategy:
@@ -198,6 +198,24 @@ jobs:
             prefix: "6.18"
           - tag: v7.0.14
             prefix: "7.0"
+          # The same sequence in Go. Every implementation that stays
+          # clean here is C and the only one that hangs is Go, so this
+          # splits "the Go runtime" from "the ublk-go library".
+          - tag: v6.18.40
+            prefix: "6.18"
+            impl: go
+          # Split control commands across two threads per device -- the
+          # one shape measured to matter in ublk-go, and the one every
+          # reproducer so far has accidentally avoided.
+          - tag: v6.18.40
+            prefix: "6.18"
+            split: "1"
+          - tag: v7.0.14
+            prefix: "7.0"
+            split: "1"
+          - tag: v7.0.14
+            prefix: "7.0"
+            impl: go
     steps:
       - uses: actions/checkout@v4
       - name: Enable KVM
@@ -233,15 +251,23 @@ jobs:
           ls "/lib/modules/${kver}/kernel/drivers/block/"ublk_drv.ko*
           sudo chmod 644 "/boot/vmlinuz-${kver}"
           echo "KVER=${kver}" >> "$GITHUB_ENV"
+      - uses: actions/setup-go@v5
+        if: matrix.impl == 'go'
+        with:
+          go-version: "1.26"
       - name: Build
-        run: make
+        run: |
+          make
+          if [ "${{ matrix.impl }}" = go ]; then
+            (cd go-repro && go build -o ublk_churn_repro_go .)
+          fi
       - name: Run in microVM
         run: |
           set -eux
           rm -f vm-status
           vng --run "/boot/vmlinuz-${KVER}" --user root --cpus 4 --memory 4G \
             --rwdir "$PWD" --verbose -- \
-            /bin/bash "$PWD/ci/guest.sh" "${{ matrix.prefix }}" || true
+            /bin/bash "$PWD/ci/guest.sh" "${{ matrix.prefix }}" noudev "${{ matrix.impl }}" "${{ matrix.split }}" || true
           echo "guest status: $(cat vm-status 2>/dev/null || echo '<none>')"
           test "$(cat vm-status)" = "0"
 
