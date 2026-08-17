@@ -54,6 +54,11 @@ fi
 # $3 picks the implementation. The Go port runs the identical syscall
 # sequence with no ublk-go dependency, to tell "the Go runtime" apart
 # from "the ublk-go library" as the missing ingredient.
+# $4 splits a device's control commands across two threads.
+if [ -n "${4:-}" ]; then
+	export REPRO_SPLIT_CTRL=1
+	echo "REPRO_SPLIT_CTRL=1"
+fi
 if [ "${3:-c}" = go ]; then
 	./go-repro/ublk_churn_repro_go 3000 30
 	echo $? >"$status"

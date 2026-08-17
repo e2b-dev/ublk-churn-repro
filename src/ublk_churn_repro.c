@@ -426,6 +426,34 @@ struct iter_arg {
 
 static void *iteration_fn(void *p);
 
+// REPRO_SPLIT_CTRL=1 issues START_DEV from a different thread than the
+// one that issued ADD_DEV and SET_PARAMS, so a single device's control
+// commands land in two io_uring task contexts.
+//
+// That split is the one thing measured to matter in ublk-go: pinning New
+// to a single thread took mainline 7.0.14 from 14 hangs per 50 churn
+// runs to 2, and 6.18.40 from 12/20 to 1/30. Every reproducer so far has
+// accidentally been in the pinned shape -- one thread per device for all
+// control commands -- which is why they all stay clean.
+struct startdev_arg {
+	struct ring *ctrl;
+	int ctrl_fd;
+	uint32_t dev_id;
+	int res;
+};
+
+static void *startdev_fn(void *p)
+{
+	struct startdev_arg *sa = p;
+	struct ublksrv_ctrl_cmd start;
+	memset(&start, 0, sizeof(start));
+	start.dev_id = sa->dev_id;
+	start.queue_id = UINT16_MAX;
+	start.data[0] = (uint64_t)getpid();
+	sa->res = ctrl_cmd(sa->ctrl, sa->ctrl_fd, UBLK_U_CMD_START_DEV, &start);
+	return NULL;
+}
+
 // REPRO_SHARED_CTRL=1 restores the original shape (one control ring on
 // the process's first thread) for an A/B against ublk-go's.
 static int g_shared_ctrl;
@@ -780,12 +808,21 @@ static void *iteration_fn(void *p)
 
 		g_phase = 2;
 		alarm(watchdog_s);
-		struct ublksrv_ctrl_cmd start;
-		memset(&start, 0, sizeof(start));
-		start.dev_id = dev_id;
-		start.queue_id = UINT16_MAX;
-		start.data[0] = (uint64_t)getpid();
-		res = ctrl_cmd(&ctrl, ctrl_fd, UBLK_U_CMD_START_DEV, &start);
+		if (getenv("REPRO_SPLIT_CTRL")) {
+			struct startdev_arg sa = { ctrlp, ctrl_fd, dev_id, 0 };
+			pthread_t st;
+			if (pthread_create(&st, NULL, startdev_fn, &sa) != 0)
+				die("pthread_create startdev");
+			pthread_join(st, NULL);
+			res = sa.res;
+		} else {
+			struct ublksrv_ctrl_cmd start;
+			memset(&start, 0, sizeof(start));
+			start.dev_id = dev_id;
+			start.queue_id = UINT16_MAX;
+			start.data[0] = (uint64_t)getpid();
+			res = ctrl_cmd(&ctrl, ctrl_fd, UBLK_U_CMD_START_DEV, &start);
+		}
 		if (res < 0) {
 			fprintf(stderr, "iter %ld START_DEV: %s\n", i, strerror(-res));
 			goto fail;
