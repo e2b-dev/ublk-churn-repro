@@ -209,9 +209,11 @@ jobs:
           # reproducer so far has accidentally avoided.
           - tag: v6.18.40
             prefix: "6.18"
+            impl: c
             split: "1"
           - tag: v7.0.14
             prefix: "7.0"
+            impl: c
             split: "1"
           - tag: v7.0.14
             prefix: "7.0"
